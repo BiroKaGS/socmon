@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 # 1. Target Locations & Critical Infrastructure Units
 KEYWORDS = [
     "CISF Jamnagar",
+    "CISF",
     "Reliance Jamnagar",
     "Sikka Thermal",
     "GSECL Sikka",
