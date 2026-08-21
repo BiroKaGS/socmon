@@ -25,7 +25,7 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-        run: python social_monitor.py
+        run: python monitor.py
 
       - name: Save State Cache
         run: |
