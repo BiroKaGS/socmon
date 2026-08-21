@@ -1,34 +1,36 @@
-name: Social Media Monitor
+name: Security & Incident Monitor
 
 on:
-  repository_dispatch:
-    types: [social-monitor-trigger]
-  workflow_dispatch: {}
+  schedule:
+    - cron: '*/30 * * * *'  # Runs every 30 minutes
+  workflow_dispatch:        # Allows manual trigger from GitHub UI
 
 permissions:
   contents: write
 
 jobs:
-  check:
+  run-monitor:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Check out repo
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Run social media monitor
+      - name: Execute Monitor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-        run: python3 -u social_monitor.py
-
-      - name: Commit updated state
         run: |
-          git config user.name "social-monitor-bot"
-          git config user.email "actions@github.com"
+          python monitor.py
+
+      - name: Commit and Push Updated State
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action Bot"
           git add state.json
-          git diff --staged --quiet || (git commit -m "Update seen-posts state [skip ci]" && git pull --rebase && git push)
+          git diff-index --quiet HEAD || git commit -m "Auto-update monitored state [skip ci]"
+          git push
