@@ -1,10 +1,11 @@
 """
 Social Media & Threat Intelligence Monitor - Jamnagar & Coastal Gujarat
-Platforms: YouTube API v3, Google Social (X, FB, Insta), Reddit RSS, Telegram
+Platforms: YouTube API v3, Google Social (X, FB, Insta, Telegram), Reddit RSS
 Timestamps: Indian Standard Time (IST)
 """
 
 import email.utils
+import html
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 # 1. Target Locations & Critical Infrastructure Units
@@ -29,7 +31,7 @@ KEYWORDS = [
     "જામનગર સિક્કા",  # Jamnagar Sikka (Gujarati)
 ]
 
-# 2. Strict Filter: Incident, Threat, Disaster, and Security Triggers (English + Gujarati)
+# 2. Strict Boolean Filter for Google Social Feeds
 INCIDENT_FILTER = (
     'fire OR blast OR explosion OR accident OR drone OR strike OR protest OR agitation OR '
     'curfew OR "law and order" OR trespass OR breach OR leak OR casualty OR "oil spill" OR '
@@ -37,11 +39,11 @@ INCIDENT_FILTER = (
     'પોલીસ OR આગ OR અકસ્માત OR વિરોધ OR હડતાળ OR ડ્રોન OR સુરક્ષા OR બ્લાસ્ટ'
 )
 
-# Incident trigger list for local parsing (YouTube/Telegram)
+# Incident trigger list for local text parsing (YouTube / Reddit)
 INCIDENT_KEYWORDS_LIST = [
-    "fire", "blast", "explosion", "accident", "drone", "strike", "protest", 
-    "agitation", "curfew", "law and order", "trespass", "breach", "leak", 
-    "casualty", "oil spill", "narcotics", "seized", "deployment", "alert", 
+    "fire", "blast", "explosion", "accident", "drone", "strike", "protest",
+    "agitation", "curfew", "law and order", "trespass", "breach", "leak",
+    "casualty", "oil spill", "narcotics", "seized", "deployment", "alert",
     "drill", "cisf", "police", "coast guard", "navy", "security",
     "આગ", "અકસ્માત", "વિરોધ", "હડતાળ", "ડ્રોન", "સુરક્ષા", "બ્લાસ્ટ", "ઝડપાયા"
 ]
@@ -72,7 +74,7 @@ def load_state():
 def save_state(seen_links_list):
     trimmed = seen_links_list[-4000:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"seen_links": trimmed}, f, indent=2)
+        json.dump({"seen_links": trimmed}, f, indent=2, ensure_ascii=False)
 
 
 def fetch_youtube_api(keyword):
@@ -92,7 +94,7 @@ def fetch_youtube_api(keyword):
     }
 
     url = f"https://www.googleapis.com/youtube/v3/search?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers={"User-Agent": "SecurityIntelBot/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
 
     items = []
     try:
@@ -100,9 +102,9 @@ def fetch_youtube_api(keyword):
             data = json.loads(resp.read().decode("utf-8"))
 
         for item in data.get("items", []):
-            video_id = item["id"].get("videoId")
+            video_id = item.get("id", {}).get("videoId")
             snippet = item.get("snippet", {})
-            title = snippet.get("title", "").strip()
+            title = html.unescape(snippet.get("title", "").strip())
             desc = snippet.get("description", "").lower()
             text_body = f"{title.lower()} {desc}"
 
@@ -133,7 +135,7 @@ def fetch_google_social(keyword):
 
         root = ET.fromstring(data)
         for item in root.findall(".//item"):
-            title = item.findtext("title", "").strip()
+            title = html.unescape(item.findtext("title", "").strip())
             link = item.findtext("link", "").strip()
             guid = item.findtext("guid", link).strip()
             pub_date_str = item.findtext("pubDate", "").strip()
@@ -165,42 +167,50 @@ def fetch_google_social(keyword):
 
 
 def fetch_reddit(keyword):
-    """Pulls Reddit submissions filtered by keyword and incident terms."""
-    query = f'"{keyword}" ({INCIDENT_FILTER})'
-    encoded = urllib.parse.quote(query)
-    url = f"https://www.reddit.com/search.rss?q={encoded}&sort=new"
-
-    req = urllib.request.Request(url, headers={"User-Agent": "SecurityIntelBot/1.0"})
+    """Pulls Reddit discussions via resilient Google indexing (bypasses 429 blocks)."""
     items = []
-    now = datetime.now(timezone.utc)
-    max_age = timedelta(hours=MAX_POST_AGE_HOURS)
-
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        reddit_query = f'site:reddit.com "{keyword}" ({INCIDENT_FILTER})'
+        encoded = urllib.parse.quote(reddit_query)
+        url = f"https://news.google.com/rss/search?q={encoded}&hl=en-IN&gl=IN&ceid=IN:en"
+
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
             data = resp.read()
 
         root = ET.fromstring(data)
-        atom_ns = "http://www.w3.org/2005/Atom"
-        for entry in root.findall(f"{{{atom_ns}}}entry"):
-            title = entry.findtext(f"{{{atom_ns}}}title", "").strip()
-            link_elem = entry.find(f"{{{atom_ns}}}link")
-            link = link_elem.attrib.get("href", "").strip() if link_elem is not None else ""
-            pub_str = entry.findtext(f"{{{atom_ns}}}updated", "").strip()
+        now = datetime.now(timezone.utc)
+        max_age = timedelta(hours=MAX_POST_AGE_HOURS)
 
-            if pub_str:
+        for item in root.findall(".//item"):
+            title = html.unescape(item.findtext("title", "").strip())
+            link = item.findtext("link", "").strip()
+            guid = item.findtext("guid", link).strip()
+            pub_date_str = item.findtext("pubDate", "").strip()
+
+            if pub_date_str:
                 try:
-                    pub_dt = datetime.fromisoformat(pub_str)
+                    pub_dt = email.utils.parsedate_to_datetime(pub_date_str)
                     if now - pub_dt > max_age:
                         continue
                 except Exception:
                     pass
 
             if title and link:
-                items.append((f"[Reddit] {title}", link, link))
+                items.append((f"[Reddit] {title}", link, guid))
     except Exception as e:
         print(f"Reddit notice for '{keyword}': {e}", flush=True)
 
     return items
+
+
+def fetch_all_sources_for_keyword(kw):
+    """Collects results for a single keyword across all platforms."""
+    combined = []
+    combined.extend(fetch_youtube_api(kw))
+    combined.extend(fetch_google_social(kw))
+    combined.extend(fetch_reddit(kw))
+    return kw, combined
 
 
 def send_notification(title, message, priority="default", tags="", retries=2):
@@ -208,7 +218,9 @@ def send_notification(title, message, priority="default", tags="", retries=2):
         print(f"[Alert Console]: {title}\n{message}\n", flush=True)
         return
 
-    headers = {"Title": title, "Priority": priority}
+    # Encode non-ASCII characters (e.g. Gujarati script/emojis) for HTTP header safety
+    safe_title = title.encode("utf-8").decode("latin-1", "replace")
+    headers = {"Title": safe_title, "Priority": priority}
     if tags:
         headers["Tags"] = tags
 
@@ -226,7 +238,7 @@ def send_notification(title, message, priority="default", tags="", retries=2):
             if e.code == 429 and attempt < retries:
                 time.sleep(4 * attempt)
                 continue
-            print(f"Notification error: {e}", flush=True)
+            print(f"Notification HTTP Error ({e.code}): {e.reason}", flush=True)
             return
         except Exception as e:
             print(f"Notification dispatch failed: {e}", flush=True)
@@ -269,18 +281,17 @@ def main():
     quiet_keywords = []
 
     try:
+        # Run all keyword sweeps concurrently across threads
+        results_map = {}
+        with ThreadPoolExecutor(max_workers=min(len(KEYWORDS), 8)) as executor:
+            future_to_kw = {executor.submit(fetch_all_sources_for_keyword, kw): kw for kw in KEYWORDS}
+            for future in as_completed(future_to_kw):
+                kw, posts = future.result()
+                results_map[kw] = posts
+
+        # Process results in original order
         for kw in KEYWORDS:
-            matched_posts = []
-
-            # 1. Official YouTube Data API v3
-            matched_posts.extend(fetch_youtube_api(kw))
-
-            # 2. Indexed Facebook, Instagram, X, Telegram
-            matched_posts.extend(fetch_google_social(kw))
-
-            # 3. Reddit Search RSS
-            matched_posts.extend(fetch_reddit(kw))
-
+            matched_posts = results_map.get(kw, [])
             new_items = []
             for title, link, guid in matched_posts:
                 item_id = guid if guid else link
@@ -294,16 +305,9 @@ def main():
             else:
                 quiet_keywords.append(kw)
 
-        if quiet_keywords:
+        if quiet_keywords and len(quiet_keywords) == len(KEYWORDS):
             now_ist = datetime.now(IST).strftime("%d %b %Y, %I:%M %p IST")
-            quiet_summary = "\n".join([f"• {k}" for k in quiet_keywords])
-            send_notification(
-                f"Security Patrol: No Incidents ({len(quiet_keywords)} monitored targets)",
-                f"Scan completed at {now_ist}.\nQuiet sectors:\n{quiet_summary}",
-                priority="min",
-                tags="shield"
-            )
-            print(f"Routine scan clear for {len(quiet_keywords)} sectors.", flush=True)
+            print(f"Routine scan clear: No incidents reported across monitored sectors at {now_ist}.", flush=True)
 
     finally:
         save_state(seen_links_list)
